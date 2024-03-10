@@ -1,4 +1,5 @@
 #include "inject.h"
+#include <endian.h>
 
 DeviceInfo* get_device_info(libusb_device_handle* handle) {
   DeviceInfo* ret = malloc(sizeof(DeviceInfo));
@@ -10,29 +11,26 @@ DeviceInfo* get_device_info(libusb_device_handle* handle) {
 }
 
 
+void cleanup(libusb_device_handle* handle) {
+  libusb_release_interface(handle, 0);
+  libusb_close(handle);
+}
+
 unsigned char* build_packet(size_t len) {
-  unsigned char* ret = malloc(sizeof(char) *
+  unsigned char* ret = malloc(sizeof(unsigned char) *
 			      (PACKET_SIZE + len));
   memset(ret, 0, PACKET_SIZE + len);
   ret[0] = (unsigned char)(STD_REQ_DEV_TOH_TOE);
   ret[1] = (unsigned char)(GET_STATUS);
-  ret[6] = (len >> 8) & 0xff;
-  ret[7] = len & 0xff;
+  ret[6] = len & 0xff;
+  ret[7] = (len >> 8) & 0xff;
   
   return ret;
 }
 
 char* pad_number(int n) {
   char* ret = malloc(sizeof(char) * 4);
-  if (n < 10) {
-    sprintf(ret, "00%d", n);
-    return ret;
-  }
-  if (n < 100) {
-    sprintf(ret, "0%d", n);
-    return ret;
-  }
-  sprintf(ret, "%d", n);
+  sprintf(ret, "%03d", (unsigned char) n);
   return ret;
 }
 
@@ -46,6 +44,7 @@ char* format_usb_path(int bus, int addr) {
   strcat(path, second_format);
   free(first_format);
   free(second_format);
+  printf("path = %s\n", path);
   return path;
 }
 
@@ -87,18 +86,25 @@ int __internal_event_callback(struct libusb_context* c,
   int rc;
   libusb_get_device_descriptor(dev, &desc);
   if (ev == LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED) {
+    fprintf(stderr, "The NX has arrived!\n");
     rc = libusb_open(dev, &dev_handle);
     if (rc != LIBUSB_SUCCESS) {
       fprintf(stderr, "FAILED TO OPEN THE NX DEVICE\n");
+      fprintf(stderr, "reason: %s\n", libusb_strerror(rc));
       return 0;
     }
     nx_count++;
     nx_handle = dev_handle;
+    libusb_set_configuration(nx_handle, 1);
+    libusb_set_auto_detach_kernel_driver(nx_handle, 1);
+    libusb_claim_interface(nx_handle, 0);
     return 0;
   }
   if (ev == LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT) {
     nx_count--;
+    fprintf(stderr, "The NX has left!\n");
     if (dev_handle) {
+      libusb_release_interface(nx_handle, 0);
       libusb_close(dev_handle);
       dev_handle = NULL;
     }
@@ -117,6 +123,7 @@ void wait_for_nx() {
 				     LIBUSB_HOTPLUG_NO_FLAGS,
 				     __internal_event_callback,
 				     NULL, &nx_wait);
+  
   if (rc != LIBUSB_SUCCESS) {
     fprintf(stderr, "Fatal error: FAILED TO CREATE A LIBUSB CALLBACK");
     libusb_exit(NULL);
@@ -138,49 +145,51 @@ unsigned char* read_bytes(libusb_device_handle* handle,
 			     len, &total, 1000);
 
   if (*rc == 0) return ret;
-  if (*rc == LIBUSB_ERROR_NO_DEVICE) {
-    fprintf(stderr, "THE NX HAS DISCONNECTED!\n");
-    return NULL;
-  }
-  if (*rc == LIBUSB_ERROR_TIMEOUT) {
-    fprintf(stderr, "TRANSFER TIMEOUT (reading)\n");
-    return NULL;
-  }
-  fprintf(stderr, "UNKNOWN ERROR ON NX TRANSFER (reading)\n");
+  free(ret);
+  fprintf(stderr, "ERROR: %s\n", libusb_strerror(*rc));
   return NULL;
 }
 
-void write_bytes(libusb_device_handle* handle,
-		 unsigned char* data, int len, int* rc) {
+int write_bytes(libusb_device_handle* handle,
+		 unsigned char* data, size_t len, int* rc) {
   int total;
   *rc = libusb_bulk_transfer(handle, 0x01, data,
-			     len, &total, 1000);
+			    len, &total, 1000);
+  return total;
 }
 
 DeviceInfo* setup_connection() {
   int cur_buf = 0;
   size_t total_written = 0;
-  libusb_device_handle* handle =
-    libusb_open_device_with_vid_pid(NULL, NX_VID, NX_PID);
-  wait_for_nx();
+  nx_handle = libusb_open_device_with_vid_pid(NULL, NX_VID, NX_PID);
+  if (nx_handle  == NULL)
+    wait_for_nx();
   DeviceInfo* info = get_device_info(nx_handle);
   printf("NX FOUND!\n");
   return info;
 }
 int cur_cpy_buf = 0;
-void write_to_rcm(libusb_device_handle* handle,
-		  unsigned char* data, int len) {
-  int packet_size = 0x1000;
+int write_to_rcm(libusb_device_handle* handle,
+		  unsigned char* data, size_t len) {
+  size_t packet_size = 0x1000;
   while (len > 0) {
-    int to_transmit = (packet_size < len) ? packet_size : len;
+    size_t to_transmit = (packet_size < len) ? packet_size : len;
     unsigned char* chunk = malloc(sizeof(char) * to_transmit);
     memcpy(chunk, data, to_transmit);
     data = data + to_transmit;
     len -= to_transmit;
     cur_cpy_buf = 1 - cur_cpy_buf;
     int status;
-    write_bytes(handle, data, len, &status);
+    printf("about to write %zu bytes\n", to_transmit);
+    int written = write_bytes(handle, data, to_transmit, &status);
+    printf("written %d bytes!\n", written);
+    fprintf(stderr, "status = %s\n", libusb_strerror(status));
+    if (status != 0) {
+      cleanup(handle);
+      return -1;
+    }
   }
+  return 0;
 }
 
 size_t get_current_buf() { return CPY_BUF_ADDR(cur_cpy_buf); }
@@ -218,7 +227,62 @@ void trigger_memcpy(DeviceInfo* info, size_t length) {
   trigger_vulnerability(info, length);
 }
 
-void hax() {
-  wait_for_nx();
+FileInfo* read_file(const char* path) {
+  FILE* fd = fopen(path, "rb");
+  FileInfo* info = malloc(sizeof(FileInfo));
+  fseek(fd, 0, SEEK_END);
+  info->length = ftell(fd);
+  fseek(fd, 0, SEEK_SET);
+  info->contents = malloc(info->length * sizeof(char));
+  fread(info->contents, info->length, 1, fd);
+  fclose(fd);
+  return info;
+}
+
+void hax(const char* interm_p, const char* payload_p) {
+  DeviceInfo* nx = setup_connection();
   printf("found the Console!\n");
+  int status = 0;
+  unsigned char* devid = read_bytes(nx->handle, 16, &status);
+  printf("device id = %s\n", devid);
+  printf("preparing the payload...\n");
+  unsigned char payload[0x30298] = {0};
+  size_t off = 680; // the first 680 bytes are 0
+
+  FileInfo* interm;
+  FileInfo* usr_payload;
+
+  interm = read_file(interm_p);
+  usr_payload = read_file(payload_p);
+  
+  *(uint32_t*) payload = htole32(0x30298);
+  for (int i = RCM_PAYLOAD_ADDR; i < INTERMEZZO_LOCATION; i+=4, off += 4)
+    *(uint32_t*) &payload[off] = htole32(INTERMEZZO_LOCATION);
+
+  memcpy(payload+off, interm->contents, interm->length);
+  off += PAYLOAD_START_ADDR - (RCM_PAYLOAD_ADDR + interm->length);
+
+  size_t to_read = (usr_payload->length < (0x30298 - off)) ?
+		   usr_payload->length : 0x30298 - off;
+  
+  memcpy(payload+off, usr_payload->contents, to_read);
+
+  // the index 'off' is now the total length of the payload
+  
+  free(interm->contents);
+  free(interm);
+  free(usr_payload->contents);
+  free(usr_payload);
+  
+  printf("Uploading the payload...\n");
+  if (write_to_rcm(nx->handle, payload, off)) {
+    libusb_release_interface(nx->handle, 0);
+    libusb_close(nx->handle);
+  };
+
+  // switch to the high rcm buffer
+  switch_to_highbuf(nx->handle);
+  trigger_memcpy(nx, 0);
+  libusb_release_interface(nx->handle, 0);
+  libusb_close(nx->handle);
 }

@@ -7,9 +7,12 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+
+#define _BSD_SOURCE
+
 // platform-independent constants
 #define RCM_PAYLOAD_ADDR ((size_t) 0x40010000) 
-#define RCM_START_ADDR ((size_t) 0x40010E40)
+#define PAYLOAD_START_ADDR ((size_t) 0x40010E40)
 #define STACK_SPRAY_START ((size_t) 0x40014E40)
 #define STACK_SPRAY_END ((size_t) 0x40017000)
 #define STD_REQ_DEV_TOH_TOE ((size_t) 0x82)
@@ -18,6 +21,10 @@
 #define GET_CONFIG ((size_t) 0x8)
 #define GET_STATUS ((size_t) 0x0)
 
+// taken from fusee-nano
+
+#define INTERMEZZO_LOCATION ((size_t) 0x4001F000)
+#define PAYLOAD_LOAD_BLOCK ((size_t) 0x40020000)
 // Linux-specific constants
 
 #define PACKET_SIZE ((size_t) 8)
@@ -52,7 +59,7 @@ typedef struct {
 } SubmitURBIoctl;
 
 
-// get an handle fora device with
+// get an handle for a device with
 // libusb_open_device_with_vid_pid() and then
 // you can find all the other info and store them in
 // this struct.
@@ -61,6 +68,11 @@ typedef struct {
   uint8_t addr;
   libusb_device_handle* handle;
 } DeviceInfo;
+
+typedef struct {
+  size_t length;
+  unsigned char* contents;
+} FileInfo;
 
 DeviceInfo*
 get_device_info(libusb_device_handle* handle);
@@ -86,13 +98,13 @@ void wait_for_nx();
 
 unsigned char* read_bytes(libusb_device_handle* handle,
 			  int len, int* rc);
-void write_bytes(libusb_device_handle* handle,
-		 unsigned char* data, int len, int* rc);
+int write_bytes(libusb_device_handle* handle,
+		 unsigned char* data, size_t len, int* rc);
 
 DeviceInfo* setup_connection();
 
-void write_to_rcm(libusb_device_handle* handle,
-		  unsigned char* data, int len);
+int write_to_rcm(libusb_device_handle* handle,
+		  unsigned char* data, size_t len);
 
 size_t trigger_vulnerability(DeviceInfo* info, size_t length);
 
