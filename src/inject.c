@@ -11,11 +11,6 @@ DeviceInfo* get_device_info(libusb_device_handle* handle) {
 }
 
 
-void cleanup(libusb_device_handle* handle) {
-  libusb_release_interface(handle, 0);
-  libusb_close(handle);
-}
-
 unsigned char* build_packet(size_t len) {
   unsigned char* ret = malloc(sizeof(unsigned char) *
 			      (PACKET_SIZE + len));
@@ -85,8 +80,8 @@ int __internal_event_callback(struct libusb_context* c,
   struct libusb_device_descriptor desc;
   int rc;
   libusb_get_device_descriptor(dev, &desc);
-  if (ev == LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED) {
-    fprintf(stderr, "The NX has arrived!\n");
+  if ((dev_handle == NULL) &&
+      (ev == LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED)) {
     rc = libusb_open(dev, &dev_handle);
     if (rc != LIBUSB_SUCCESS) {
       fprintf(stderr, "FAILED TO OPEN THE NX DEVICE\n");
@@ -95,9 +90,6 @@ int __internal_event_callback(struct libusb_context* c,
     }
     nx_count++;
     nx_handle = dev_handle;
-    libusb_set_configuration(nx_handle, 1);
-    libusb_set_auto_detach_kernel_driver(nx_handle, 1);
-    libusb_claim_interface(nx_handle, 0);
     return 0;
   }
   if (ev == LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT) {
@@ -139,7 +131,8 @@ void wait_for_nx() {
 
 unsigned char* read_bytes(libusb_device_handle* handle,
 			  int len, int* rc) {
-  unsigned char* ret = malloc(sizeof(char) * 1000);
+  unsigned char* ret = malloc(1 + (sizeof(char) * len));
+  ret[len] = '\0';
   int total;
   *rc = libusb_bulk_transfer(handle, 0x81, ret,
 			     len, &total, 1000);
@@ -159,13 +152,10 @@ int write_bytes(libusb_device_handle* handle,
 }
 
 DeviceInfo* setup_connection() {
-  int cur_buf = 0;
-  size_t total_written = 0;
   nx_handle = libusb_open_device_with_vid_pid(NULL, NX_VID, NX_PID);
   if (nx_handle  == NULL)
     wait_for_nx();
   DeviceInfo* info = get_device_info(nx_handle);
-  printf("NX FOUND!\n");
   return info;
 }
 int cur_cpy_buf = 0;
@@ -185,7 +175,6 @@ int write_to_rcm(libusb_device_handle* handle,
     printf("written %d bytes!\n", written);
     fprintf(stderr, "status = %s\n", libusb_strerror(status));
     if (status != 0) {
-      cleanup(handle);
       return -1;
     }
   }
@@ -228,13 +217,13 @@ void trigger_memcpy(DeviceInfo* info, size_t length) {
 }
 
 FileInfo* read_file(const char* path) {
-  FILE* fd = fopen(path, "rb");
+  FILE* fd = fopen(path, "r");
   FileInfo* info = malloc(sizeof(FileInfo));
   fseek(fd, 0, SEEK_END);
   info->length = ftell(fd);
   fseek(fd, 0, SEEK_SET);
   info->contents = malloc(info->length * sizeof(char));
-  fread(info->contents, info->length, 1, fd);
+  size_t readb = fread(info->contents, 1, info->length, fd);
   fclose(fd);
   return info;
 }
@@ -243,8 +232,13 @@ void hax(const char* interm_p, const char* payload_p) {
   DeviceInfo* nx = setup_connection();
   printf("found the Console!\n");
   int status = 0;
+
   unsigned char* devid = read_bytes(nx->handle, 16, &status);
-  printf("device id = %s\n", devid);
+  printf("device id = ");
+  for (int i = 0; i < 16; ++i) {
+    printf("%x ", devid[i]);
+  }
+  printf("\n");
   printf("preparing the payload...\n");
   unsigned char payload[0x30298] = {0};
   size_t off = 680; // the first 680 bytes are 0
@@ -260,13 +254,13 @@ void hax(const char* interm_p, const char* payload_p) {
     *(uint32_t*) &payload[off] = htole32(INTERMEZZO_LOCATION);
 
   memcpy(payload+off, interm->contents, interm->length);
-  off += PAYLOAD_START_ADDR - (RCM_PAYLOAD_ADDR + interm->length);
+  off += PAYLOAD_LOAD_BLOCK - INTERMEZZO_LOCATION;
 
   size_t to_read = (usr_payload->length < (0x30298 - off)) ?
 		   usr_payload->length : 0x30298 - off;
   
   memcpy(payload+off, usr_payload->contents, to_read);
-
+  off += to_read;
   // the index 'off' is now the total length of the payload
   
   free(interm->contents);
@@ -278,6 +272,7 @@ void hax(const char* interm_p, const char* payload_p) {
   if (write_to_rcm(nx->handle, payload, off)) {
     libusb_release_interface(nx->handle, 0);
     libusb_close(nx->handle);
+    return;
   };
 
   // switch to the high rcm buffer
